@@ -98,6 +98,14 @@ class CatchSim:
         self.bm = beatmap
         self.kiai_ranges = getattr(beatmap.timing, "kiai", []) if beatmap.timing is not None else []
         self.frames = frames
+        # Mirror detection (see _maybe_apply_mirror) BEFORE any object-
+        # derived state is built, so a flipped playfield is consistent
+        # everywhere (sim, draw, obj-index). Distances are flip-invariant
+        # so hyperdash marking is unaffected.
+        try:
+            self._maybe_apply_mirror(beatmap, frames)
+        except Exception:
+            pass
         # catcher facing timeline (lazer VisualDirection) — built lazily from
         # self.frames on first _facing_at call (frames can still be shifted by
         # _calibrate_offset during setup, which invalidates this).
@@ -230,6 +238,57 @@ class CatchSim:
     # lazer combo-portion log accumulation constants (CatchScoreProcessor)
     _COMBO_BASE = 4
     _COMBO_CAP = 200
+
+    def _maybe_apply_mirror(self, beatmap, frames) -> None:
+        """lazer\'s Mirror mod flips the catch playfield horizontally (x -> 512-x),
+        but lazer stores its mods in a block osrparse does not expose -- the stable
+        mods bitfield reads 0 -- so without this we place every fruit on the wrong
+        side and the recorded catcher \'catches nothing\' (~100% geometry/.osr
+        disagreement -> the honesty guard false-rejects a legit replay). Detect it
+        the same way _calibrate_offset detects a constant time shift: if flipping x
+        makes the RECORDED catcher align far better than the un-flipped layout, the
+        player used Mirror -- apply the flip to every object. A horizontal flip
+        preserves inter-fruit distances, so hyperdash marking is unaffected; only
+        absolute positions (catch test + draw) change, which is exactly right.
+        Guarded to only fire on an overwhelming signal, so a normal replay (which
+        already aligns un-flipped) is never touched.
+        """
+        import sys as _sys
+        from dataclasses import replace as _replace
+        from osu_catch_renderer.beatmap.replay import catcher_x_at
+        if len(frames) < 50 or not beatmap.objects:
+            return
+        half = cs_to_catcher_half_width(beatmap.cs)
+        span_end = frames[-1].time_ms
+        objs = [o for o in beatmap.objects
+                if o.kind is not ObjType.BANANA and o.time_ms <= span_end]
+        if len(objs) > 1500:
+            objs = objs[:: (len(objs) // 1500) + 1]
+        if len(objs) < 60:
+            return
+
+        def _rate(mirror: bool) -> float:
+            hit = 0
+            for o in objs:
+                cx, _ = catcher_x_at(frames, o.time_ms)
+                ox = (512.0 - o.x) if mirror else o.x
+                if abs(cx - ox) <= half:
+                    hit += 1
+            return hit / len(objs)
+
+        base = _rate(False)
+        if base >= 0.5:            # already aligns un-flipped -> not mirrored
+            return
+        mir = _rate(True)
+        if mir >= 0.85 and (mir - base) >= 0.30:
+            try:
+                beatmap.objects[:] = [_replace(o, x=512.0 - o.x)
+                                      for o in beatmap.objects]
+            except Exception:
+                return
+            print(f"[catch] Mirror detected (catcher align {base*100:.0f}% -> "
+                  f"{mir*100:.0f}%); flipped playfield (lazer Mirror mod is not "
+                  f"in the stable mods field)", file=_sys.stderr, flush=True)
 
     def _calibrate_offset(self) -> None:
         """A handful of catch replays carry a constant timeline shift vs the
