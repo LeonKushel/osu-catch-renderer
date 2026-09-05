@@ -1038,7 +1038,7 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
                                pre_normalized=pre)
             if af:
                 cmd += ["-af", af]
-        cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest"]
+        cmd += ["-c:a", "aac", "-ar", "48000", "-b:a", "192k", "-shortest"]
 
     # web-streamable: move the moov atom to the front so browsers/iOS can
     # play before the whole file downloads (loudnorm re-adds this, but be
