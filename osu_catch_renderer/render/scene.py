@@ -103,7 +103,7 @@ class CatchSim:
         # everywhere (sim, draw, obj-index). Distances are flip-invariant
         # so hyperdash marking is unaffected.
         try:
-            self._maybe_apply_mirror(beatmap, frames)
+            self._maybe_apply_mirror(beatmap, frames, meta)
         except Exception:
             pass
         # catcher facing timeline (lazer VisualDirection) — built lazily from
@@ -239,7 +239,7 @@ class CatchSim:
     _COMBO_BASE = 4
     _COMBO_CAP = 200
 
-    def _maybe_apply_mirror(self, beatmap, frames) -> None:
+    def _maybe_apply_mirror(self, beatmap, frames, meta) -> None:
         """lazer\'s Mirror mod flips the catch playfield horizontally (x -> 512-x),
         but lazer stores its mods in a block osrparse does not expose -- the stable
         mods bitfield reads 0 -- so without this we place every fruit on the wrong
@@ -257,6 +257,12 @@ class CatchSim:
         from dataclasses import replace as _replace
         from osu_catch_renderer.beatmap.replay import catcher_x_at
         if len(frames) < 50 or not beatmap.objects:
+            return
+        # Catch Mirror is a LAZER-only mod (CatchModMirror). Stable Catch
+        # geometry can never legitimately be mirror-configured, so never let
+        # this heuristic mutate a stable replay's geometry. lazer legacy
+        # export version is >= 30000000.
+        if int(getattr(meta, "game_version", 0) or 0) < 30000000:
             return
         half = cs_to_catcher_half_width(beatmap.cs)
         span_end = frames[-1].time_ms
@@ -282,8 +288,17 @@ class CatchSim:
         mir = _rate(True)
         if mir >= 0.85 and (mir - base) >= 0.30:
             try:
-                beatmap.objects[:] = [_replace(o, x=512.0 - o.x)
-                                      for o in beatmap.objects]
+                def _flip(o):
+                    kw = {"x": 512.0 - o.x}
+                    htx = getattr(o, "hyper_target_x", None)
+                    if htx is not None:
+                        # hyper_target_x is an ABSOLUTE playfield coord (where
+                        # the catcher must reach to complete the hyperdash) --
+                        # mirror it too, else the hyperdash glow/termination
+                        # timing lands on the wrong side.
+                        kw["hyper_target_x"] = 512.0 - htx
+                    return _replace(o, **kw)
+                beatmap.objects[:] = [_flip(o) for o in beatmap.objects]
             except Exception:
                 return
             print(f"[catch] Mirror detected (catcher align {base*100:.0f}% -> "
