@@ -62,13 +62,23 @@ class _FrameWriter:
     # a 4-deep queue let every stall block the render thread.
     _QUEUE_FRAMES = 12
 
-    def __init__(self, proc):
+    def __init__(self, proc, *, best_effort: bool = False,
+                 queue_frames: "int | None" = None):
         self._stdin = proc.stdin
-        self._q: "queue.Queue" = queue.Queue(maxsize=self._QUEUE_FRAMES)
+        # best_effort (the embed sidecar): a broken/stalled embed encoder must
+        # NEVER fail or stall the master render — push() degrades to a no-op and
+        # the node re-encodes as before. The master writer keeps the strict
+        # raise-on-error contract.
+        self._best_effort = best_effort
+        self._q: "queue.Queue" = queue.Queue(
+            maxsize=queue_frames or self._QUEUE_FRAMES)
         self._werr: BaseException | None = None
         self._hash = None
         self._hash_frames = 0
-        if os.environ.get("R3D_FRAME_MD5"):
+        # Only the master writer emits the frame-stream hash — the embed sidecar
+        # sees the SAME frames, so a second digest would just be noise (and the
+        # tee's whole point is that the master stream is unchanged).
+        if os.environ.get("R3D_FRAME_MD5") and not best_effort:
             self._hash = hashlib.blake2b(digest_size=16)
         self._thread = threading.Thread(target=self._writer,
                                         name="ffmpeg-writer", daemon=True)
@@ -99,11 +109,25 @@ class _FrameWriter:
                 self._werr = e
 
     def push(self, frame_rgb) -> None:
-        """Queue one frame. Re-raises the writer thread's error, so a dead
-        ffmpeg surfaces here just like the old synchronous write did
-        (BrokenPipeError included)."""
+        """Queue one frame. The master writer re-raises the writer thread's
+        error, so a dead ffmpeg surfaces here just like the old synchronous
+        write did (BrokenPipeError included). A best-effort (embed sidecar)
+        writer NEVER raises and NEVER blocks the render indefinitely: on a
+        writer error it drops silently, and on a full queue it waits only
+        briefly before disabling itself (a stalled embed encoder must not pace
+        the master render)."""
         if self._werr is not None:
+            if self._best_effort:
+                return
             raise self._werr
+        if self._best_effort:
+            try:
+                self._q.put(frame_rgb, timeout=5.0)
+            except queue.Full:
+                self._werr = RuntimeError("embed sidecar stalled; disabled")
+                print("[catch] inline embed sidecar stalled -> disabled "
+                      "(node will re-encode)", file=sys.stderr, flush=True)
+            return
         self._q.put(frame_rgb)
 
     def close(self) -> None:
@@ -141,9 +165,18 @@ class _CompositeWorker:
     _QUEUE = 3
 
     def __init__(self, hud, writer, fl, perf=None, *, death_ms=None,
-                 death_fade_ms=0.0):
+                 death_fade_ms=0.0, embed_writer=None, embed_stride=1):
         self._hud = hud
         self._writer = writer
+        # Optional best-effort second sink: the 720p Discord-embed sidecar, fed
+        # the SAME composited frames as the master so it is ready at render-done
+        # (no post-render re-encode). None => unchanged single-output behaviour.
+        # embed_stride decimates the sidecar to ~30 fps (every Nth frame) so the
+        # second pipe carries far fewer frames and libx264 encodes a fraction of
+        # the work -> the tee's cost on the master render stays small.
+        self._embed_writer = embed_writer
+        self._embed_stride = max(1, int(embed_stride))
+        self._embed_i = 0
         self._fl = fl
         self._perf = perf
         self._death_ms = death_ms
@@ -185,7 +218,7 @@ class _CompositeWorker:
                         if p > 0.0:
                             out = apply_death(out, p)
                     self.last_gameplay = out
-                    self._writer.push(out)
+                    self._emit(out)
                 elif kind == "r":             # outro: results screen
                     if self.last_gameplay is None:
                         raise CatchRenderError(
@@ -194,14 +227,26 @@ class _CompositeWorker:
                     out = a(self.last_gameplay)
                     if perf is not None:
                         perf["results"] += pc() - t0
-                    self._writer.push(out)
+                    self._emit(out)
                 else:                         # "f": frozen gameplay frame
                     if self.last_gameplay is None:
                         raise CatchRenderError(
                             "outro before any gameplay frame")
-                    self._writer.push(self.last_gameplay)
+                    self._emit(self.last_gameplay)
             except BaseException as e:  # noqa: BLE001 — surfaced on push()
                 self._werr = e
+
+    def _emit(self, frame) -> None:
+        """Hand one finished frame to the master writer (strict) and, when the
+        inline-embed sidecar is enabled, every Nth frame to its best-effort
+        writer (decimated to ~30 fps). The master push happens FIRST and is
+        byte-for-byte the old single-output behaviour; the embed push is
+        decimated + can never raise (best-effort)."""
+        self._writer.push(frame)
+        if self._embed_writer is not None:
+            if self._embed_i % self._embed_stride == 0:
+                self._embed_writer.push(frame)
+            self._embed_i += 1
 
     def push(self, item) -> None:
         """Queue one work item; re-raises this thread's error so a failed
@@ -629,8 +674,11 @@ def render_core(
             from osu_catch_renderer.hud.lb_cards import build_catch_board
             baked_board = build_catch_board(cfg, meta, bm, replay_md5)
         except Exception as e:  # noqa: BLE001 — a board must never break a render
-            import sys
-            print(f"[catch-renderer] leaderboard skipped: {e}", file=sys.stderr)
+            # aliased: a bare `import sys` here would make `sys` a LOCAL of the
+            # whole render_core, breaking every other `sys.stderr` in the function
+            # (incl. the inline-embed logs) with UnboundLocalError.
+            import sys as _lbsys
+            print(f"[catch-renderer] leaderboard skipped: {e}", file=_lbsys.stderr)
             baked_board = None
     # Async pipeline (ported from the std renderer's proven design):
     #   * GPU readback goes through a 3-deep PBO ring (read_rgb_async returns
@@ -652,6 +700,34 @@ def render_core(
            "results": 0.0, "enq": 0.0}
     _pc = time.perf_counter
     writer = _FrameWriter(proc)
+    # INLINE EMBED SIDECAR (R3D_EMBED_INLINE=1, default OFF): produce the 720p
+    # Discord embed DURING the render from the same composited frames, so it is
+    # ready at render-done and the node skips its post-render re-encode pass.
+    # Single renders only (overlays are multi-catcher). Fully best-effort — any
+    # spawn/encode failure leaves no sidecar and the node re-encodes as before.
+    # The master output is untouched (byte-identical frame stream).
+    embed_path = None
+    embed_proc = None
+    embed_writer = None
+    embed_stride = 1
+    if os.environ.get("R3D_EMBED_INLINE") == "1" and not overlay_extra:
+        try:
+            # decimate the sidecar to ~30 fps (every Nth composited frame) so a
+            # 60 fps master feeds the embed encoder half the frames.
+            embed_stride = max(1, round(float(cfg.fps) / 30.0))
+            embed_path = output_path.parent / (output_path.stem + ".embed-sm.mp4")
+            embed_proc = _spawn_embed_ffmpeg(
+                cfg, embed_path, audio, start_ms, rate, total_dur_s,
+                hitsound_wav=hits_wav, is_nc=is_nc,
+                in_fps=float(cfg.fps) / embed_stride)
+            embed_writer = _FrameWriter(embed_proc, best_effort=True,
+                                        queue_frames=24)
+            print(f"[catch] inline embed sidecar -> {embed_path.name}",
+                  file=sys.stderr, flush=True)
+        except Exception as _ee:  # noqa: BLE001 — sidecar must never break a render
+            print(f"[catch] inline embed spawn failed ({_ee}); node re-encodes",
+                  file=sys.stderr, flush=True)
+            embed_path = embed_proc = embed_writer = None
     pending = deque()          # scene snapshots awaiting their pixels
 
     # osu!catch Flashlight (FL, mod bit 1<<10): a soft-edged black vignette
@@ -672,7 +748,8 @@ def render_core(
     _death_arg = float(death_ms) if failed else None
     _death_fade = FAIL_FADE_MS * rate if failed else 0.0
     comp = _CompositeWorker(hud, writer, fl, perf=_pt if _PERF else None,
-                            death_ms=_death_arg, death_fade_ms=_death_fade)
+                            death_ms=_death_arg, death_fade_ms=_death_fade,
+                            embed_writer=embed_writer, embed_stride=embed_stride)
 
     def _emit_gameplay(raw):
         scene = pending.popleft()
@@ -770,6 +847,43 @@ def render_core(
             except BrokenPipeError:
                 pass
         ret = proc.wait()
+        # MASTER render time — measured at master completion, BEFORE the embed
+        # finalize, so the reported render speed reflects the render alone.
+        _render_wall = time.monotonic() - _t_render0
+        # inline embed sidecar: drain + finalize AFTER the master (a stalled
+        # embed can never delay the master's completion). Best-effort — any
+        # failure just leaves no sidecar and the node re-encodes as before.
+        if embed_writer is not None or embed_proc is not None:
+            _embed_t0 = time.monotonic()
+            if embed_writer is not None:
+                try:
+                    embed_writer.close()
+                except BaseException:  # noqa: BLE001 — never fails a render
+                    pass
+            _eret = -1
+            if embed_proc is not None:
+                try:
+                    if embed_proc.stdin:
+                        try:
+                            embed_proc.stdin.close()
+                        except BrokenPipeError:
+                            pass
+                    _eret = embed_proc.wait(timeout=180)
+                except Exception:  # noqa: BLE001
+                    try:
+                        embed_proc.kill()
+                        embed_proc.wait(timeout=10)
+                    except Exception:  # noqa: BLE001
+                        pass
+            _embed_ok = (_eret == 0 and embed_path is not None
+                         and embed_path.exists()
+                         and embed_path.stat().st_size > 8_000)
+            _embed_tail = time.monotonic() - _embed_t0
+            print("[catch] inline embed sidecar "
+                  f"{'READY' if _embed_ok else 'FAILED'} "
+                  f"({embed_path.name if embed_path else '?'}; "
+                  f"finalize tail {_embed_tail:.1f}s)",
+                  file=sys.stderr, flush=True)
         renderer.release()
         # drop the temp hitsound WAV (R3D_CATCH_KEEP_HITS=1 keeps it for
         # alignment debugging/verification)
@@ -779,7 +893,9 @@ def render_core(
             except OSError:
                 pass
         import sys as _rsys
-        _wall = time.monotonic() - _t_render0
+        # render-only wall (excludes the embed finalize tail) so the bot-parsed
+        # "done:" speed reflects the render, not the sidecar.
+        _wall = _render_wall
         if _PERF:
             import sys as _psys
             print("PERF " + " ".join(f"{k}={v:.2f}s" for k, v in _pt.items()),
@@ -1079,6 +1195,102 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
         # fcntl` raises ModuleNotFoundError (an ImportError, NOT OSError) which
         # used to escape and crash EVERY catch render (exit 1). Skip the pipe-size
         # optimization there -- the render is correct with the default pipe.
+        pass
+    proc._catch_errlog = errf.name  # type: ignore[attr-defined]
+    return proc
+
+
+def _embed_video_bps(total_dur_s: "float | None") -> int:
+    """VBV target for the 720p Discord sidecar — the SAME recipe the node
+    (r3d_local_ready) and coordinator (queue_hooks) run post-render: cap the
+    average bitrate by duration to the 24 MiB crawler budget, minus a 128 kbps
+    audio allowance, clamped to [0.5, 1.4] Mbps."""
+    if total_dur_s and total_dur_s > 0:
+        return max(500_000, min(1_400_000,
+                                int(24 * 1024 * 1024 * 8 / total_dur_s) - 128_000))
+    return 1_400_000
+
+
+def _spawn_embed_ffmpeg(cfg: RenderConfig, embed_path: Path, audio: "Path | None",
+                        start_ms: int, rate: float = 1.0,
+                        total_dur_s: "float | None" = None,
+                        hitsound_wav: "Path | None" = None, is_nc: bool = False,
+                        in_fps: "float | None" = None):
+    """Concurrent 720p Discord-embed sidecar, fed the SAME composited RGBA
+    frames as the master (see _CompositeWorker). Producing it DURING the render
+    removes the node's post-render re-encode pass, so the sidecar is ready the
+    instant the render finishes. Recipe mirrors the node encode it replaces:
+    scale to 720p @30, libx264 veryfast + VBV to the 24 MiB budget, 48 kHz AAC.
+    The audio graph is IDENTICAL to the master's (shared loudnorm PCM cache — a
+    warm hit here, no double loudnorm work). Fully best-effort at the writer:
+    if this ffmpeg dies the sidecar is simply absent and the node re-encodes."""
+    w, h = cfg.resolution
+    v_bps = _embed_video_bps(total_dur_s)
+    # Frames arrive pre-decimated to `in_fps` (composite-thread stride), so the
+    # input rate IS in_fps -> playback speed stays correct and no fps filter is
+    # needed. Fewer input frames == less pipe traffic + less libx264 work.
+    # nice -n 15: the sidecar runs at LOW priority so it consumes only spare
+    # cores and never steals from the render's (CPU/GIL-bound) frame generation.
+    # If the box is saturated it simply finishes a beat after render-done —
+    # still far cheaper than the node's from-scratch post-render re-encode.
+    cmd = ["nice", "-n", "15",
+           "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+           "-f", "rawvideo", "-pix_fmt", "rgba", "-s", f"{w}x{h}",
+           "-r", str(in_fps or cfg.fps), "-i", "pipe:0"]
+    prenorm = None
+    if audio is not None:
+        prenorm = loudnorm_cache.get_or_build_normalized(
+            audio, rate=rate, pitch=is_nc)
+        if prenorm is not None:
+            cmd += ["-f", "f32le",
+                    "-ar", str(loudnorm_cache.LOUDNORM_CACHE_SR),
+                    "-ac", str(loudnorm_cache.LOUDNORM_CACHE_CH),
+                    "-i", str(prenorm)]
+        else:
+            cmd += ["-i", str(audio)]
+        if hitsound_wav is not None:
+            cmd += ["-i", str(hitsound_wav)]
+    # video: decimate to 30 fps + scale to 720p (the crawler-safe embed size).
+    if audio is not None and hitsound_wav is not None:
+        # hitsound path needs -filter_complex for the audio mix; append the
+        # video scale to the same graph so both are mapped explicitly.
+        pre = prenorm is not None
+        fc = _hitsound_filter_complex(
+            start_ms, rate, total_dur_s,
+            music_volume=cfg.music_volume, general_volume=cfg.general_volume,
+            audio_offset_ms=cfg.audio_offset_ms,
+            hitsound_volume=getattr(cfg, "hitsound_volume", 100),
+            is_nc=is_nc, pre_normalized=pre)
+        fc += ";[0:v]scale=-2:720:flags=bilinear[vs]"
+        cmd += ["-filter_complex", fc, "-map", "[vs]", "-map", "[aout]"]
+    else:
+        cmd += ["-vf", "scale=-2:720:flags=bilinear"]
+        if audio is not None:
+            pre = prenorm is not None
+            af = _audio_filter(
+                start_ms, rate, total_dur_s,
+                music_volume=cfg.music_volume, general_volume=cfg.general_volume,
+                audio_offset_ms=cfg.audio_offset_ms, is_nc=is_nc,
+                pre_normalized=pre)
+            if af:
+                cmd += ["-af", af]
+    # CPU encode: veryfast + VBV; cap threads so a contributor desktop stays
+    # usable while the GPU handles the master (same governance as libx264 above).
+    _thr = ["-threads", str(max(2, (os.cpu_count() or 4) - 2))]
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            "-b:v", str(v_bps), "-maxrate", str(int(v_bps * 1.25)),
+            "-bufsize", str(v_bps * 2), "-g", "30"] + _thr
+    if audio is not None:
+        cmd += ["-c:a", "aac", "-ar", "48000", "-b:a", "128k", "-shortest"]
+    cmd += ["-movflags", "+faststart", str(embed_path)]
+    import tempfile
+    errf = tempfile.NamedTemporaryFile(
+        prefix="catch_embed_", suffix=".log", delete=False, mode="w+")
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=errf, bufsize=0)
+    try:
+        import fcntl
+        fcntl.fcntl(proc.stdin.fileno(), 1031, 1 << 20)
+    except (OSError, ImportError, AttributeError):
         pass
     proc._catch_errlog = errf.name  # type: ignore[attr-defined]
     return proc
