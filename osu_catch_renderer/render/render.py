@@ -1291,7 +1291,15 @@ def _spawn_embed_ffmpeg(cfg: RenderConfig, embed_path: Path, audio: "Path | None
                 cmd += ["-af", af]
     # CPU encode: veryfast + VBV; cap threads so a contributor desktop stays
     # usable while the GPU handles the master (same governance as libx264 above).
-    _thr = ["-threads", str(max(2, (os.cpu_count() or 4) - 2))]
+    # Thread cap sweet spot (idle-box sweep 2026-09-27): ~half the cores, capped
+    # at 6. libx264 veryfast 1080p60 keeps pace with the render at 4-6 threads
+    # (finalize tail ~0.5s either way), and a LOWER cap stops the companion
+    # fighting the CPU/GIL-bound frame generation for cores -> +5% render instead
+    # of +22% at the old cpu-2 cap. Override with R3D_EMBED_THREADS.
+    _emb_thr = os.environ.get("R3D_EMBED_THREADS", "")
+    _nthr = int(_emb_thr) if _emb_thr.isdigit() and int(_emb_thr) > 0 \
+        else max(2, min(6, (os.cpu_count() or 4) // 2))
+    _thr = ["-threads", str(_nthr)]
     cmd += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
             "-crf", "21", "-maxrate", str(maxrate),
             "-bufsize", str(max(1, maxrate // 2)),
