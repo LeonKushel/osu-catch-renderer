@@ -712,9 +712,11 @@ def render_core(
     embed_stride = 1
     if os.environ.get("R3D_EMBED_INLINE") == "1" and not overlay_extra:
         try:
-            # decimate the sidecar to ~30 fps (every Nth composited frame) so a
-            # 60 fps master feeds the embed encoder half the frames.
-            embed_stride = max(1, round(float(cfg.fps) / 30.0))
+            # decimate the sidecar to the plan's fps (60 keeps every frame; 30
+            # takes every Nth) so the companion encoder never does more temporal
+            # work than the target companion needs.
+            _plan_fps = _embed_compact_plan(total_dur_s)[3]
+            embed_stride = max(1, round(float(cfg.fps) / float(_plan_fps)))
             embed_path = output_path.parent / (output_path.stem + ".embed-sm.mp4")
             embed_proc = _spawn_embed_ffmpeg(
                 cfg, embed_path, audio, start_ms, rate, total_dur_s,
@@ -1200,15 +1202,25 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
     return proc
 
 
-def _embed_video_bps(total_dur_s: "float | None") -> int:
-    """VBV target for the 720p Discord sidecar — the SAME recipe the node
-    (r3d_local_ready) and coordinator (queue_hooks) run post-render: cap the
-    average bitrate by duration to the 24 MiB crawler budget, minus a 128 kbps
-    audio allowance, clamped to [0.5, 1.4] Mbps."""
-    if total_dur_s and total_dur_s > 0:
-        return max(500_000, min(1_400_000,
-                                int(24 * 1024 * 1024 * 8 / total_dur_s) - 128_000))
-    return 1_400_000
+def _embed_compact_plan(total_dur_s: "float | None") -> "tuple[int, int, int, int]":
+    """(scale_h, maxrate_bps, audio_bps, fps) for the Discord companion — mirrors
+    embed_attach._compact_plan at the config default 80 MiB budget so the sidecar
+    is the SAME to-spec asset the node/bot would produce and can be adopted
+    verbatim (embed_attach.compact_meets_target). Short plays keep 1080p60; longer
+    step to 720p60; only a genuinely too-small budget drops to 720p30."""
+    budget_bits = 80 * 1024 * 1024 * 8
+    dur = float(total_dur_s or 0.0)
+    if dur <= 1:
+        return 1080, 8_000_000, 192_000, 60
+    total_rate = int(budget_bits / dur) or 1
+    pref = 192_000 if dur <= 240 else (128_000 if dur <= 600 else 96_000)
+    audio = min(pref, max(32_000, total_rate // 4))
+    maxrate = max(32_000, min(8_000_000, total_rate - audio))
+    if maxrate >= 3_000_000:
+        return 1080, maxrate, audio, 60
+    if maxrate >= 500_000:
+        return 720, maxrate, audio, 60
+    return 720, maxrate, audio, 30
 
 
 def _spawn_embed_ffmpeg(cfg: RenderConfig, embed_path: Path, audio: "Path | None",
@@ -1216,16 +1228,19 @@ def _spawn_embed_ffmpeg(cfg: RenderConfig, embed_path: Path, audio: "Path | None
                         total_dur_s: "float | None" = None,
                         hitsound_wav: "Path | None" = None, is_nc: bool = False,
                         in_fps: "float | None" = None):
-    """Concurrent 720p Discord-embed sidecar, fed the SAME composited RGBA
-    frames as the master (see _CompositeWorker). Producing it DURING the render
-    removes the node's post-render re-encode pass, so the sidecar is ready the
-    instant the render finishes. Recipe mirrors the node encode it replaces:
-    scale to 720p @30, libx264 veryfast + VBV to the 24 MiB budget, 48 kHz AAC.
-    The audio graph is IDENTICAL to the master's (shared loudnorm PCM cache — a
-    warm hit here, no double loudnorm work). Fully best-effort at the writer:
-    if this ffmpeg dies the sidecar is simply absent and the node re-encodes."""
+    """Concurrent Discord-companion sidecar produced DURING the render from the
+    SAME composited RGBA frames (see _CompositeWorker). Recipe mirrors
+    embed_attach.transcode_compact at the to-spec plan (1080p60 short -> 720p60 ->
+    720p30) so the node can ADOPT it verbatim (compact_meets_target) instead of
+    re-encoding post-render — the sidecar is ready the instant the render
+    finishes. libx264 crf21 + VBV to the plan maxrate, 48 kHz AAC. Audio graph
+    identical to the master's (shared loudnorm PCM cache — a warm hit, no double
+    loudnorm). Best-effort at the writer: if this ffmpeg dies the sidecar is
+    simply absent and the node re-encodes."""
     w, h = cfg.resolution
-    v_bps = _embed_video_bps(total_dur_s)
+    scale_h, maxrate, audio_bps, _plan_fps = _embed_compact_plan(total_dur_s)
+    if scale_h > h:
+        scale_h = h  # never upscale beyond the master's height
     # Frames arrive pre-decimated to `in_fps` (composite-thread stride), so the
     # input rate IS in_fps -> playback speed stays correct and no fps filter is
     # needed. Fewer input frames == less pipe traffic + less libx264 work.
@@ -1261,10 +1276,10 @@ def _spawn_embed_ffmpeg(cfg: RenderConfig, embed_path: Path, audio: "Path | None
             audio_offset_ms=cfg.audio_offset_ms,
             hitsound_volume=getattr(cfg, "hitsound_volume", 100),
             is_nc=is_nc, pre_normalized=pre)
-        fc += ";[0:v]scale=-2:720:flags=bilinear[vs]"
+        fc += f";[0:v]scale=-2:{scale_h}:flags=bilinear[vs]"
         cmd += ["-filter_complex", fc, "-map", "[vs]", "-map", "[aout]"]
     else:
-        cmd += ["-vf", "scale=-2:720:flags=bilinear"]
+        cmd += ["-vf", f"scale=-2:{scale_h}:flags=bilinear"]
         if audio is not None:
             pre = prenorm is not None
             af = _audio_filter(
@@ -1278,10 +1293,12 @@ def _spawn_embed_ffmpeg(cfg: RenderConfig, embed_path: Path, audio: "Path | None
     # usable while the GPU handles the master (same governance as libx264 above).
     _thr = ["-threads", str(max(2, (os.cpu_count() or 4) - 2))]
     cmd += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-            "-b:v", str(v_bps), "-maxrate", str(int(v_bps * 1.25)),
-            "-bufsize", str(v_bps * 2), "-g", "30"] + _thr
+            "-crf", "21", "-maxrate", str(maxrate),
+            "-bufsize", str(max(1, maxrate // 2)),
+            "-g", str(int(_plan_fps))] + _thr
     if audio is not None:
-        cmd += ["-c:a", "aac", "-ar", "48000", "-b:a", "128k", "-shortest"]
+        cmd += ["-c:a", "aac", "-ar", "48000",
+                "-b:a", str(audio_bps), "-shortest"]
     cmd += ["-movflags", "+faststart", str(embed_path)]
     import tempfile
     errf = tempfile.NamedTemporaryFile(
