@@ -1207,8 +1207,13 @@ def _embed_compact_plan(total_dur_s: "float | None") -> "tuple[int, int, int, in
     embed_attach._compact_plan at the config default 80 MiB budget so the sidecar
     is the SAME to-spec asset the node/bot would produce and can be adopted
     verbatim (embed_attach.compact_meets_target). Short plays keep 1080p60; longer
-    step to 720p60; only a genuinely too-small budget drops to 720p30."""
-    budget_bits = 80 * 1024 * 1024 * 8
+    step to 720p60; only a genuinely too-small budget drops to 720p30.
+
+    Budget is 56 MiB (NOT the bot's 80 MiB): a NODE companion must stay under the
+    64 MiB node->coordinator sidecar upload limit, matching the client
+    embed_variants.go cap (0.4.10). Raise both only once the coordinator upload
+    limit is raised."""
+    budget_bits = 56 * 1024 * 1024 * 8
     dur = float(total_dur_s or 0.0)
     if dur <= 1:
         return 1080, 8_000_000, 192_000, 60
