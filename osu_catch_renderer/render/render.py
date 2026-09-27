@@ -121,6 +121,17 @@ class _FrameWriter:
                 return
             raise self._werr
         if self._best_effort:
+            # COPY before queueing: the embed sidecar lags the master and its
+            # queue is far deeper than the render's readback ring, so it must NOT
+            # retain a reference to a pooled/zero-copy readback buffer. That
+            # buffer is reused within a few frames; the writer thread would then
+            # serialize whatever OVERWROTE it, producing an out-of-order,
+            # HUD-flickering companion (the scrambled Discord embed). A private
+            # copy decouples the queued frame from ring reuse. Decimated => cheap.
+            try:
+                frame_rgb = frame_rgb.copy()
+            except AttributeError:
+                frame_rgb = bytes(frame_rgb)
             try:
                 self._q.put(frame_rgb, timeout=5.0)
             except queue.Full:
