@@ -245,6 +245,12 @@ class _CompositeWorker:
                         if p > 0.0:
                             out = apply_death(out, p)
                     self.last_gameplay = out
+                    if _DUMP is not None:
+                        _i = getattr(self, "_dump_n", 0)
+                        self._dump_n = _i + 1
+                        if _i in _DUMP[1]:
+                            import numpy as _dnp
+                            _dnp.save(f"{_DUMP[0]}/f{_i:06d}.npy", out)
                     self._emit(out)
                 elif kind == "r":             # outro: results screen
                     if self.last_gameplay is None:
