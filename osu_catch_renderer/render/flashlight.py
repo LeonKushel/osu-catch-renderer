@@ -121,6 +121,32 @@ class CatchFlashlight:
             return False
 
     # -- the post-pass ---------------------------------------------------------
+    def gl_params(self, scene):
+        """(cx, cy, R, Ro) for the GL multiply-blend pass, or None when there is
+        no catcher geometry (apply() would return the frame unchanged).
+
+        ADVANCES THE 800 ms RAMP STATE exactly once via _size(), so apply() must
+        NOT also run for the same frame -- _size mutates _cur/_from/_to/_start and
+        a double call corrupts the ramp. The render thread owns this decision and
+        the composite thread is told to skip; see render.py.
+
+        Disc collapsed (R <= 0): apply() returns an all-black frame, so return
+        (0, 0, -1, 0). In the shader that makes denom = 1 and t = clamp(dist+1)
+        = 1 for every pixel -> keep = 0 -> exactly black, with no extra uniform.
+        """
+        cx = getattr(scene, "catcher_px", None)
+        cy = getattr(scene, "plane_y_px", None)
+        unit = getattr(scene, "pf_unit_px", None)
+        if cx is None or cy is None or not unit or unit <= 0:
+            return None
+        break_active = self._is_break(getattr(scene, "time_ms", 0))
+        combo = int(getattr(scene, "combo", 0) or 0)
+        R = self._size(float(getattr(scene, "time_ms", 0)),
+                       combo, break_active) * unit
+        if R <= 0:
+            return (0.0, 0.0, -1.0, 0.0)
+        return (float(cx), float(cy), float(R), float(R * SMOOTHNESS))
+
     def apply(self, rgb: "np.ndarray", scene) -> "np.ndarray":
         """Darken ``rgb`` (H,W,3 uint8) outside the lit circle centred on the
         catcher plate. Returns a NEW array (GL readback is read-only). If the

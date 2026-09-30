@@ -21,6 +21,8 @@ from pathlib import Path
 import pathlib
 
 import numpy as np
+
+from osu_catch_renderer.render._round8 import to8_clipped as _to8c
 from PIL import Image, ImageDraw, ImageFont
 
 from osu_catch_renderer.skin.assets import build_textures
@@ -149,6 +151,15 @@ class _FrameWriter:
                   f"({self._hash_frames} frames)", file=sys.stderr, flush=True)
 
 
+# HARNESS: R3D_CATCH_DUMP=dir,i0,i1,... saves the RAW composited gameplay frame
+# (post-flashlight, post-HUD, pre-encode) so two runs can be diffed exactly.
+_dump_env = os.environ.get("R3D_CATCH_DUMP")
+_DUMP = None
+if _dump_env:
+    _dp = _dump_env.split(",")
+    _DUMP = (_dp[0], {int(x) for x in _dp[1:]})
+
+
 class _CompositeWorker:
     """HUD/results compositing pipeline stage (render thread -> here ->
     _FrameWriter). The render thread hands work items over a small bounded
@@ -208,11 +219,16 @@ class _CompositeWorker:
                 return
             if self._werr is not None:
                 continue                      # drain (never emit after error)
-            kind, a, b = item
+            kind, a, b = item[0], item[1], item[2]
+            # 4th element (gameplay only): the render thread already drew the
+            # flashlight as a GL quad this frame, so do NOT run the CPU pass --
+            # CatchFlashlight._size() is STATEFUL (an 800 ms ramp) and a second
+            # call per frame corrupts it.
+            fl_on_gpu = item[3] if len(item) > 3 else False
             try:
                 if kind == "g":               # gameplay: flashlight + HUD
                     raw, scene = a, b
-                    if self._fl is not None:
+                    if self._fl is not None and not fl_on_gpu:
                         raw = self._fl.apply(raw, scene)
                     t0 = pc() if perf is not None else 0.0
                     out = self._hud.overlay(raw, scene)
@@ -597,7 +613,8 @@ def render_core(
     def _gray(rgba):
         r = np.asarray(rgba).astype(np.float32)
         lum = 0.299 * r[..., 0] + 0.587 * r[..., 1] + 0.114 * r[..., 2]
-        return np.clip(np.stack([lum, lum, lum, r[..., 3]], axis=-1), 0, 255).astype(np.uint8)
+        return _to8c(np.clip(np.stack([lum, lum, lum, r[..., 3]], axis=-1),
+                             0, 255))
     for key in _overlay_gray_keys:
         renderer.upload_texture(f"{key}__ovl", _gray(skin.textures[key]))
     for key, ctex in _player_catcher_bakes:
@@ -751,6 +768,11 @@ def render_core(
     # (a versus overlay has many catchers); strictly gated on the FL bit, so
     # non-FL replays render byte-identically.
     fl = None
+    # R3D_CATCH_GPU_FL: draw the flashlight as ONE multiply-blend quad inside the
+    # main GL pass instead of a CPU numpy post-pass on the composite thread.
+    # Z-order is preserved: the HUD is still composited on the CPU after readback,
+    # so it stays ABOVE the flashlight exactly as lazer has it.
+    _CGPU_FL = bool(os.environ.get("R3D_CATCH_GPU_FL"))
     if has_flashlight(getattr(meta, "mods", 0)) and not overlay_extra:
         fl = CatchFlashlight(break_env=getattr(sim, "_break_env", None))
 
@@ -764,10 +786,15 @@ def render_core(
                             death_ms=_death_arg, death_fade_ms=_death_fade,
                             embed_writer=embed_writer, embed_stride=embed_stride)
 
+    # Loop-INVARIANT flashlight-on-GPU decision (reconciled onto embed-tee):
+    # a constant, not a per-frame local, because _emit runs ~2 frames behind the
+    # PBO ring; the worker safely defaults off for a 3-tuple push.
+    _FL_ON_GPU = (fl is not None) and _CGPU_FL
+
     def _emit_gameplay(raw):
         scene = pending.popleft()
         _t0 = _pc()
-        comp.push(("g", raw, scene))
+        comp.push(("g", raw, scene, _FL_ON_GPU))
         _pt["enq"] += _pc() - _t0
 
     try:
@@ -800,6 +827,12 @@ def render_core(
                         storyboard.draw_overlay(t, b)
                     _t2 = _pc(); _pt["draw"] += _t2 - _t1
                     pending.append(scene)
+                    # flashlight BEFORE readback and before the CPU HUD, so the
+                    # HUD lands on top. gl_params advances the 800 ms ramp ONCE.
+                    if _FL_ON_GPU:
+                        _flp = fl.gl_params(scene)
+                        if _flp is not None:
+                            renderer.draw_flashlight(*_flp)
                     raw = renderer.read_rgb_async()
                     _pt["read"] += _pc() - _t2
                     if raw is not None:

@@ -47,6 +47,7 @@ from pathlib import Path
 
 import numpy as np
 
+from osu_catch_renderer.render._round8 import to8_clipped as _to8c
 # ── osu!lazer FailAnimationContainer constants ──────────────────────────────
 # video-time span of the fail animation (lazer ``duration = 2500``). The caller
 # multiplies this by the playback rate for the MAP-time window, so DT/HT still
@@ -105,7 +106,7 @@ def apply_death(rgb: "np.ndarray", p: float) -> "np.ndarray":
     f *= (1.0 - GRAY_MIX * p)                 # -> 0.5x brightness at death (gray)
     f[..., 0] += (RED_ADD * 255.0) * p        # additive red (lazer red layer)
     np.clip(f, 0.0, 255.0, out=f)
-    graded = f.astype(np.uint8)
+    graded = _to8c(f)
 
     # ── affine (PIL): rotate + scale-down + fall about centre, black fill ──
     from PIL import Image

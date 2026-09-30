@@ -31,6 +31,8 @@ import math
 import os
 
 import numpy as np
+
+from osu_catch_renderer.render._round8 import to8_clipped as _to8c
 from PIL import Image, ImageFont
 
 from osu_catch_renderer.argon.argon_counter import (argon_digit_advance, argon_glyph_rgba,
@@ -834,7 +836,7 @@ class ArgonHud:
             _, f_om, f_tm = self._fill_pill
             region[:, :fw] = region[:, :fw] * f_om + f_tm
         img.paste(Image.fromarray(
-            np.clip(region, 0.0, 255.0).astype(np.uint8), "RGB"),
+            _to8c(np.clip(region, 0.0, 255.0)), "RGB"),
             (sx0, sy0))
         # info row: elapsed (left) / remaining (right), mono digits
         info_h = ARGON_INFO_H * es

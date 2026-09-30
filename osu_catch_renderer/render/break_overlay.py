@@ -64,6 +64,8 @@ import math
 from bisect import bisect_right
 
 import numpy as np
+
+from osu_catch_renderer.render._round8 import to8_clipped as _to8c
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from osu_catch_renderer.argon.argon_counter import argon_digit_advance, argon_glyph_rgba
@@ -312,7 +314,7 @@ class LazerBreakOverlay:
         # RGBA canvas: force RGB — the additive field is 3-channel and the
         # canvas alpha is GL garbage. Paste-back auto-converts (alpha=255).
         base = np.asarray(img.crop(box).convert("RGB"), np.float32)
-        out = np.clip(base + sub, 0.0, 255.0).astype(np.uint8)
+        out = _to8c(np.clip(base + sub, 0.0, 255.0))
         img.paste(Image.fromarray(out, "RGB"), box[:2])
 
     def _bar_pill(self, w_px: int, h_px: int, alpha: float) -> Image.Image:

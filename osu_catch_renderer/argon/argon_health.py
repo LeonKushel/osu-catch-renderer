@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from osu_catch_renderer.render._round8 import to8_clipped as _to8c
 # --- lazer constants (absolute px @ 1080p) -----------------------------------
 MAIN_PATH_RADIUS = 10.0
 GLOW_PATH_RADIUS = 40.0
@@ -294,7 +295,7 @@ class ArgonHealth:
         lx0, ly0 = xa - x0, ya - y0
         sub = img[ya:yb, xa:xb].astype(np.float32)
         tms = tm[ly0:ly0 + (yb - ya), lx0:lx0 + (xb - xa)]
-        img[ya:yb, xa:xb] = np.clip(sub + tms, 0, 255).astype(np.uint8)
+        img[ya:yb, xa:xb] = _to8c(np.clip(sub + tms, 0, 255))
 
     def _composite_over(self, img, layer, om, tm):
         x0, y0 = layer.ox - self._orig[0], layer.oy - self._orig[1]
@@ -307,7 +308,7 @@ class ArgonHealth:
         sub = img[ya:yb, xa:xb].astype(np.float32)
         oms = om[ly0:ly0 + (yb - ya), lx0:lx0 + (xb - xa)]
         tms = tm[ly0:ly0 + (yb - ya), lx0:lx0 + (xb - xa)]
-        img[ya:yb, xa:xb] = np.clip(sub * oms + tms, 0, 255).astype(np.uint8)
+        img[ya:yb, xa:xb] = _to8c(np.clip(sub * oms + tms, 0, 255))
 
     def update_draw(self, rgb_arr: np.ndarray, hp: float, dt_ms: float,
                     origin=(0, 0)):

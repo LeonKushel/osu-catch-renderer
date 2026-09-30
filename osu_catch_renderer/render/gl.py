@@ -271,6 +271,75 @@ class SpriteRenderer:
     # queue(12) + writer in-write(1) + slack. 24 x ~8.3 MB @1080p ≈ 200 MB.
     _HOST_POOL = 24
 
+    def draw_flashlight(self, cx: float, cy: float, R: float, Ro: float) -> None:
+        """Darken the scene to the flashlight disc with ONE full-screen
+        multiply-blend quad, replacing CatchFlashlight.apply()'s CPU post-pass.
+
+        Measured on the 55-map corpus BEFORE this: FL mean 92.4 fps vs non-FL
+        230.6 = a 2.50x collapse, and 5 of the 6 slowest maps were FL. apply()
+        allocates a full-frame np.zeros_like plus a float32 patch per FL frame.
+
+        GL computes `src*sf + dst*df`; with (ZERO, SRC_COLOR) that is `dst*keep`,
+        exactly apply()'s `rgb * keep`.
+
+        Load-bearing details:
+          * apply() measures distance from the INTEGER pixel index to the
+            UNROUNDED float centre (`arange(y0,y1) - cy`). gl_FragCoord is
+            pixel-centred, so `gl_FragCoord.x - 0.5` is that index. The centre is
+            NOT rounded here (taiko's equivalent rounds; catch does not).
+          * The scene is rendered TOP-DOWN (see _VERT: 1.0 - py/h*2), so screen
+            row = u_h - 0.5 - gl_FragCoord.y.
+          * Beyond Ro the smoothstep saturates to black, so apply()'s
+            "zeros_like everywhere, bbox only" is identical to evaluating the
+            falloff over the whole frame. No bbox needed.
+          * TESTED AND REFUTED as causes of the residual +-1 LSB: (a) rounding
+            ties -- zero exact .5 ties exist on the (dst 0-255) x (keep=k/255)
+            grid; (b) 8-bit quantisation of the keep factor -- that would affect
+            millions of pixels, not 49; (c) `length()` vs `sqrt(dx*dx+dy*dy)` to
+            match numpy's expression order -- bit-for-bit identical output. At
+            49 differing channel values in 124M the implied precision loss is
+            ~1e-6, i.e. the blend is already effectively float32. The residual is
+            genuine float32 ULP noise between two instruction orderings of the
+            same formula, and closing it would need bit-reproducible float across
+            numpy and the GPU driver. Do not chase it.
+          * apply() ends in np.rint -- it ROUNDS -- so an RGBA8 multiply blend,
+            which also rounds to nearest, should match it far more closely than
+            a truncating CPU path would.
+        """
+        if getattr(self, "_fl_prog", None) is None:
+            self._fl_prog = self.ctx.program(
+                vertex_shader="""
+                    #version 330
+                    in vec2 in_pos;
+                    void main() { gl_Position = vec4(in_pos * 2.0, 0.0, 1.0); }
+                """,
+                fragment_shader="""
+                    #version 330
+                    uniform vec2  u_c;     // unrounded centre, screen px
+                    uniform float u_R;     // lit radius
+                    uniform float u_den;   // max(Ro - R, 1e-6)
+                    uniform float u_h;     // frame height, for the y flip
+                    out vec4 f_color;
+                    void main() {
+                        float col = gl_FragCoord.x - 0.5;
+                        float row = u_h - 0.5 - gl_FragCoord.y;
+                        float d = length(vec2(col, row) - u_c);
+                        float t = clamp((d - u_R) / u_den, 0.0, 1.0);
+                        float black = t * t * (3.0 - 2.0 * t);
+                        f_color = vec4(vec3(1.0 - black), 1.0);
+                    }
+                """,
+            )
+            self._fl_vao = self.ctx.vertex_array(
+                self._fl_prog, [(self.vbo, "2f 2x4", "in_pos")])
+        self._fl_prog["u_c"].value = (float(cx), float(cy))
+        self._fl_prog["u_R"].value = float(R)
+        self._fl_prog["u_den"].value = max(float(Ro) - float(R), 1e-6)
+        self._fl_prog["u_h"].value = float(self.height)
+        self.ctx.blend_func = (moderngl.ZERO, moderngl.SRC_COLOR)
+        self._fl_vao.render(moderngl.TRIANGLE_STRIP)
+        self.ctx.blend_func = (moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA)
+
     def read_rgb_async(self) -> "np.ndarray | None":
         """Queue an async readback of the current frame into a small PBO
         ring and return the OLDEST completed frame, or None while the ring
