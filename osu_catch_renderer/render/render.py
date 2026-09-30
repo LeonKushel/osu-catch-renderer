@@ -772,7 +772,9 @@ def render_core(
     # main GL pass instead of a CPU numpy post-pass on the composite thread.
     # Z-order is preserved: the HUD is still composited on the CPU after readback,
     # so it stays ABOVE the flashlight exactly as lazer has it.
-    _CGPU_FL = bool(os.environ.get("R3D_CATCH_GPU_FL"))
+    # DEFAULT ON (ship as intended): GPU flashlight quad. Escape hatch:
+    # R3D_CATCH_GPU_FL=0 forces the old CPU post-pass.
+    _CGPU_FL = os.environ.get("R3D_CATCH_GPU_FL", "1") != "0"
     if has_flashlight(getattr(meta, "mods", 0)) and not overlay_extra:
         fl = CatchFlashlight(break_env=getattr(sim, "_break_env", None))
 
