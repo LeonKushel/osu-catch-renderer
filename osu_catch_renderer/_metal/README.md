@@ -44,7 +44,13 @@ original order, which blacks out the health bar on flashlight maps).
 
 ## The dylib
 
-`render/metal/libr3dmetal.dylib` is arm64, built from `render/metal/src/*.swift` with
-`render/metal/build.sh` (Apple Swift 6.4). A rebuild from those sources gives a
-different file hash but **byte-identical videos** on the plain, flashlight and
-failed-play maps above — rebuild it yourself rather than trusting the binary.
+`render/metal/libr3dmetal.dylib` is arm64 and is **built from `render/metal/src/*.swift`
+by `render/metal/build.sh`**, nothing else. The build is repeatable: on an M1 Max with
+Apple Swift 6.4 (swiftlang-6.4.0.34.1) it gives the same file every time —
+
+    md5    9319f5a5069b8ecb133397d829fdf505
+    sha256 a90a4e4e96e92e4a01e327d4cd1af8618b4677dd9a11f93a1d1acd431a77536a
+
+To check it, run `build.sh` on a Mac with that toolchain and compare. (The binary first
+committed with this package, md5 `aeeea727...`, was an earlier build of the same sources;
+both produce byte-identical videos on the plain, flashlight and failed-play test maps.)
