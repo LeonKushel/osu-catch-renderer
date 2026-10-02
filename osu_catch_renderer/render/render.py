@@ -686,8 +686,19 @@ def render_core(
         except Exception as e:  # noqa: BLE001 — hitsounds never break a render
             print(f"[catch-renderer] hitsounds skipped: {e}", file=sys.stderr)
             hits_wav = None
+    # INLINE PREVIEW (R3D_PREVIEW_INLINE=1, default OFF): have the SAME ffmpeg
+    # that encodes the master also write the lean 720p30 preview embed as a
+    # second output, so it is finished the moment the render is. Without it the
+    # node re-encodes the finished master afterwards (fleet medians 10-270 s)
+    # before anything can be published. Single renders only.
+    preview_path = None
+    if os.environ.get("R3D_PREVIEW_INLINE") == "1" and not overlay_extra:
+        preview_path = output_path.parent / (output_path.stem + ".embed.mp4")
+        print(f"[catch] inline preview -> {preview_path.name}",
+              file=sys.stderr, flush=True)
     proc = _spawn_ffmpeg(cfg, output_path, audio, start_ms, rate, total_dur_s,
-                         hitsound_wav=hits_wav, is_nc=is_nc)
+                         hitsound_wav=hits_wav, is_nc=is_nc,
+                         preview_path=preview_path)
     # Argon is the DEFAULT skin: skinless renders stay all-Argon (parity with
     # the STD renderer). DanserHud now handles skin_dir=None; plain _Hud only if
     # DanserHud fails to build.
@@ -1118,9 +1129,21 @@ def nvenc_target_bps(w: int, h: int, fps: float) -> int:
     return int(min(16_000_000.0, max(2_500_000.0, target)))
 
 
+def _preview_video_bps(total_dur_s: "float | None") -> int:
+    """Video bitrate of the lean preview embed. Mirrors the contributor
+    client's makeEmbedVariant (and the bot's _transcode_embed_unbounded):
+    ~1.4 Mbps, lowered on long maps so the file stays <= ~24 MiB, floor 500k."""
+    vbps = 1_400_000
+    if total_dur_s and total_dur_s > 0:
+        vbps = int(24 * 1024 * 1024 * 8 / total_dur_s) - 128_000
+        vbps = max(500_000, min(1_400_000, vbps))
+    return vbps
+
+
 def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
                   start_ms: int, rate: float = 1.0, total_dur_s: float | None = None,
-                  hitsound_wav: Path | None = None, is_nc: bool = False):
+                  hitsound_wav: Path | None = None, is_nc: bool = False,
+                  preview_path: "Path | None" = None):
     w, h = cfg.resolution
     enc, dev = _probe_encoder(cfg)
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
@@ -1156,10 +1179,11 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
         if hitsound_wav is not None:
             cmd += ["-i", str(hitsound_wav)]
 
-    # video codec + pixel path
+    # video codec + pixel path (collected in `vc`; appended below)
+    vc: list = []
     if enc == "h264_vaapi":
         if cfg.video_bitrate:
-            cmd += ["-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi",
+            vc += ["-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi",
                     "-b:v", str(cfg.video_bitrate)]
         else:
             # CQ23 quality target (#87 R3D size policy): quality-based
@@ -1167,13 +1191,13 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
             # which shrinks the node->coordinator upload (the real
             # "Finalizing" cost). VAAPI CQP is driver-dependent -> Aussie
             # to validate on AMD before the fleet bundle.
-            cmd += ["-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi",
+            vc += ["-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi",
                     "-rc_mode", "CQP", "-qp", "23"]
     elif enc == "h264_nvenc":
         if cfg.video_bitrate:
             # Explicit override -> honor the bitrate target exactly.
             _tgt = int(cfg.video_bitrate)
-            cmd += ["-c:v", "h264_nvenc", "-preset", "p4", "-pix_fmt", "yuv420p",
+            vc += ["-c:v", "h264_nvenc", "-preset", "p4", "-pix_fmt", "yuv420p",
                     "-b:v", str(_tgt), "-maxrate", str(int(_tgt * 1.5)),
                     "-bufsize", str(_tgt * 2)]
         else:
@@ -1182,7 +1206,7 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
             # lands ~3-4x under the flat bitrate -> much smaller masters
             # -> faster node->coordinator upload (the "Finalizing" cost).
             _cap = nvenc_target_bps(w, h, cfg.fps)
-            cmd += ["-c:v", "h264_nvenc", "-preset", "p4", "-pix_fmt", "yuv420p",
+            vc += ["-c:v", "h264_nvenc", "-preset", "p4", "-pix_fmt", "yuv420p",
                     "-rc", "vbr", "-cq", "23", "-b:v", "0",
                     "-maxrate", str(_cap), "-bufsize", str(_cap * 2)]
     else:
@@ -1195,43 +1219,99 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
         _thr = ["-threads", str(max(2, (os.cpu_count() or 4) - 2))]
         if cfg.video_bitrate:
             _vb = int(cfg.video_bitrate)
-            cmd += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            vc += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
                     "-b:v", str(_vb), "-maxrate", str(int(_vb * 1.5)),
                     "-bufsize", str(_vb * 2)] + _thr
         else:
-            cmd += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            vc += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
                     "-crf", "23"] + _thr
 
-    if audio is not None:
-        # `prenorm` -> canonical builders (rate/pitch + loudnorm are baked into
-        # the cached f32le input); else the original inline fused-loudnorm path.
-        pre = prenorm is not None
-        if hitsound_wav is not None:
-            # song + hitsound track: -filter_complex (the -af path can't mix a
-            # second input). The song chain is IDENTICAL to _audio_filter minus
-            # apad; hits amix AFTER the song's loudnorm (mania v2 fix #17).
-            fc = _hitsound_filter_complex(
-                start_ms, rate, total_dur_s,
-                music_volume=cfg.music_volume,
-                general_volume=cfg.general_volume,
-                audio_offset_ms=cfg.audio_offset_ms,
-                hitsound_volume=getattr(cfg, "hitsound_volume", 100),
-                is_nc=is_nc, pre_normalized=pre)
-            cmd += ["-filter_complex", fc, "-map", "0:v", "-map", "[aout]"]
-        else:
-            af = _audio_filter(start_ms, rate, total_dur_s,
-                               music_volume=cfg.music_volume,
-                               general_volume=cfg.general_volume,
-                               audio_offset_ms=cfg.audio_offset_ms, is_nc=is_nc,
-                               pre_normalized=pre)
-            if af:
-                cmd += ["-af", af]
-        cmd += ["-c:a", "aac", "-ar", "48000", "-b:a", "192k", "-shortest"]
+    acodec = ["-c:a", "aac", "-ar", "48000", "-b:a", "192k", "-shortest"]
+    if preview_path is None:
+        cmd += vc
+        if audio is not None:
+            # `prenorm` -> canonical builders (rate/pitch + loudnorm are baked into
+            # the cached f32le input); else the original inline fused-loudnorm path.
+            pre = prenorm is not None
+            if hitsound_wav is not None:
+                # song + hitsound track: -filter_complex (the -af path can't mix a
+                # second input). The song chain is IDENTICAL to _audio_filter minus
+                # apad; hits amix AFTER the song's loudnorm (mania v2 fix #17).
+                fc = _hitsound_filter_complex(
+                    start_ms, rate, total_dur_s,
+                    music_volume=cfg.music_volume,
+                    general_volume=cfg.general_volume,
+                    audio_offset_ms=cfg.audio_offset_ms,
+                    hitsound_volume=getattr(cfg, "hitsound_volume", 100),
+                    is_nc=is_nc, pre_normalized=pre)
+                cmd += ["-filter_complex", fc, "-map", "0:v", "-map", "[aout]"]
+            else:
+                af = _audio_filter(start_ms, rate, total_dur_s,
+                                   music_volume=cfg.music_volume,
+                                   general_volume=cfg.general_volume,
+                                   audio_offset_ms=cfg.audio_offset_ms, is_nc=is_nc,
+                                   pre_normalized=pre)
+                if af:
+                    cmd += ["-af", af]
+            cmd += acodec
 
-    # web-streamable: move the moov atom to the front so browsers/iOS can
-    # play before the whole file downloads (loudnorm re-adds this, but be
-    # robust if that post-step is skipped/fails).
-    cmd += ["-movflags", "+faststart", str(output_path)]
+        # web-streamable: move the moov atom to the front so browsers/iOS can
+        # play before the whole file downloads (loudnorm re-adds this, but be
+        # robust if that post-step is skipped/fails).
+        cmd += ["-movflags", "+faststart", str(output_path)]
+    else:
+        # TWO OUTPUTS FROM ONE PROCESS. The frame pipe is read once; `split`
+        # hands the SAME frames to the master encoder (unchanged settings) and
+        # to a 720p30 libx264 preview. The audio graph is the master's own, then
+        # `asplit`; the preview branch gets the loudness pass the contributor
+        # client would otherwise apply before cutting its embed, so the preview
+        # needs no post-processing at all.
+        graph = []
+        pfps = min(30, int(round(float(cfg.fps))))
+        vm_tail = "null"
+        if enc == "h264_vaapi":
+            # the master's "-vf format=nv12,hwupload" moves into the graph
+            vm_tail = "format=nv12,hwupload"
+            vc = [x for i, x in enumerate(vc)
+                  if not (x == "-vf" or (i and vc[i - 1] == "-vf"))]
+        graph.append(f"[0:v]split=2[vm0][vp0];[vm0]{vm_tail}[vm];"
+                     f"[vp0]scale=-2:720,fps={pfps}[vp]")
+        if audio is not None:
+            pre = prenorm is not None
+            if hitsound_wav is not None:
+                graph.append(_hitsound_filter_complex(
+                    start_ms, rate, total_dur_s,
+                    music_volume=cfg.music_volume,
+                    general_volume=cfg.general_volume,
+                    audio_offset_ms=cfg.audio_offset_ms,
+                    hitsound_volume=getattr(cfg, "hitsound_volume", 100),
+                    is_nc=is_nc, pre_normalized=pre))
+            else:
+                af = _audio_filter(start_ms, rate, total_dur_s,
+                                   music_volume=cfg.music_volume,
+                                   general_volume=cfg.general_volume,
+                                   audio_offset_ms=cfg.audio_offset_ms, is_nc=is_nc,
+                                   pre_normalized=pre)
+                graph.append(f"[1:a]{af or 'anull'}[aout]")
+            graph.append("[aout]asplit=2[am][ap0];"
+                         "[ap0]loudnorm=I=-18:TP=-1.5:LRA=11[ap]")
+        cmd += ["-filter_complex", ";".join(graph)]
+        # output 1: the master, exactly as without the preview
+        cmd += ["-map", "[vm]"] + (["-map", "[am]"] if audio is not None else [])
+        cmd += vc + (acodec if audio is not None else [])
+        cmd += ["-movflags", "+faststart", str(output_path)]
+        # output 2: the preview. libx264 on every node, deliberately: a second
+        # NVENC/VAAPI session can fail to open (session limits), and one failed
+        # output kills the whole process and with it the render.
+        vbps = _preview_video_bps(total_dur_s)
+        cmd += ["-map", "[vp]"] + (["-map", "[ap]"] if audio is not None else [])
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                "-b:v", str(vbps), "-maxrate", str(int(vbps * 1.25)),
+                "-bufsize", str(vbps * 2), "-g", "30",
+                "-threads", str(max(2, min(4, (os.cpu_count() or 4) - 2)))]
+        if audio is not None:
+            cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-shortest"]
+        cmd += ["-movflags", "+faststart", str(preview_path)]
     import tempfile
     errf = tempfile.NamedTemporaryFile(
         prefix="catch_ffmpeg_", suffix=".log", delete=False, mode="w+",
