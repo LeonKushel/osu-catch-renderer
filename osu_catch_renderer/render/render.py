@@ -1293,7 +1293,16 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
                                    audio_offset_ms=cfg.audio_offset_ms, is_nc=is_nc,
                                    pre_normalized=pre)
                 graph.append(f"[1:a]{af or 'anull'}[aout]")
-            graph.append("[aout]asplit=2[am][ap0];"
+            # PIN THE SHARED BRANCH TO 48 kHz BEFORE THE SPLIT. loudnorm runs at
+            # 192 kHz internally and, left alone, wins format negotiation back
+            # THROUGH asplit: the master's own chain (amix/apad on the cached
+            # 48 kHz pre-normalised song) then runs at 192 kHz and is resampled
+            # back down for the encoder, so the master's audio bytes change even
+            # though nothing about the master was touched. Measured on the
+            # loudnorm-cache path: master audio md5 differed with the preview
+            # on. With the pin the 192 kHz conversion stays on the preview branch.
+            # 48000 is what the master is encoded at (-ar 48000 below).
+            graph.append("[aout]aformat=sample_rates=48000,asplit=2[am][ap0];"
                          "[ap0]loudnorm=I=-18:TP=-1.5:LRA=11[ap]")
         cmd += ["-filter_complex", ";".join(graph)]
         # output 1: the master, exactly as without the preview
