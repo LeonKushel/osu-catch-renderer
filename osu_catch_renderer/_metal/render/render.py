@@ -1993,7 +1993,9 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
                     "-b:v", str(_vb), "-maxrate", str(int(_vb * 1.5)),
                     "-bufsize", str(_vb * 2)]
         else:
-            cmd += ["-c:v", "libx264", "-preset", _X264_PRESET, "-pix_fmt", "yuv420p", "-crf", "20"]
+            # crf 23 = the shipped GL path's value (R3D size policy #87). This
+            # backend forked before that change and was still on crf 20.
+            cmd += ["-c:v", "libx264", "-preset", _X264_PRESET, "-pix_fmt", "yuv420p", "-crf", "23"]
         # R3D_X264_PARAMS: extra -x264-params, ":"-joined. The preset ladder
         # is coarse -- veryfast to ultrafast is +32% end-to-end for 3.2x the
         # file -- so the useful points are between them: ultrafast with cabac
@@ -2034,7 +2036,9 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
                                pre_normalized=pre)
             if af:
                 cmd += ["-af", af]
-        cmd += ["-c:a", "aac", "-b:a", "192k"]
+        # -ar 48000 as on the GL path: without it the inline-loudnorm path
+        # (192 kHz internally) encodes a 96 kHz AAC master.
+        cmd += ["-c:a", "aac", "-ar", "48000", "-b:a", "192k"]
         # `-shortest` makes ffmpeg hold the audio output until it learns the
         # video length, which defers the ENTIRE audio filtergraph to after the
         # last video frame (~950 ms of dead time at 1080p; drops to 28 ms with
@@ -2092,12 +2096,11 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
                 graph.append("[1:a]anull[aout]")
                 atail = aargs
             # PIN THE SHARED BRANCH BEFORE THE SPLIT when the master is a
-            # 48 kHz stream (loudnorm-cache path, or an explicit -ar 48000).
-            # The preview's loudnorm runs at 192 kHz and otherwise wins format
-            # negotiation back THROUGH asplit, so the master's own chain would
-            # run at 192 kHz and its audio bytes change. On the inline-loudnorm
-            # path the master chain is already at 192 kHz and nothing leaks, so
-            # no pin there (a pin would CHANGE that master).
+            # 48 kHz stream (loudnorm-cache path, or an explicit -ar 48000 --
+            # which the master now always has). The preview's loudnorm runs at
+            # 192 kHz and otherwise wins format negotiation back THROUGH asplit,
+            # so the master's own chain would run at 192 kHz and its audio bytes
+            # change.
             _pin = ("aformat=sample_rates=48000,"
                     if (prenorm is not None or "48000" in atail) else "")
             graph.append(f"[aout]{_pin}asplit=2[am][ap0];"
