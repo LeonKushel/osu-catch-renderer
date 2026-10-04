@@ -699,15 +699,28 @@ def render_core(
     # A failed play gets its audio rewritten after the render
     # (apply_fail_audio), so that file is not append-only: no streaming, no
     # marker, and the client runs its normal post-render pass.
+    # INLINE DISCORD COPY (R3D_COMPACT_INLINE=1, default OFF; needs the inline
+    # preview): a THIRD output of the same ffmpeg, encoded to the compact plan
+    # the node/bot use for `-embed-sm.mp4`, so nothing is left to encode after
+    # the render. Not on failed plays: their audio is rewritten afterwards and
+    # the copy would not carry it.
+    compact_path = None
+    if (preview_path is not None and not overlay_extra and not failed
+            and _compact_wanted(total_dur_s, cfg.resolution[0], cfg.resolution[1],
+                                cfg.fps, 0.35)):
+        compact_path = output_path.parent / (output_path.stem + ".embed-sm.mp4")
+        print(f"[catch] inline discord copy -> {compact_path.name}",
+              file=sys.stderr, flush=True)
     stream_master = _stream_master_requested(overlay_extra) and not failed
     if stream_master:
-        _write_stream_marker(output_path)
+        _write_stream_marker(output_path, compact=compact_path is not None)
         print("[catch] streamable master (no faststart, loudnorm in-engine)",
               file=sys.stderr, flush=True)
     proc = _spawn_ffmpeg(cfg, output_path, audio, start_ms, rate, total_dur_s,
                          hitsound_wav=hits_wav, is_nc=is_nc,
                          preview_path=preview_path,
-                         stream_master=stream_master)
+                         stream_master=stream_master,
+                         compact_path=compact_path)
     # Argon is the DEFAULT skin: skinless renders stay all-Argon (parity with
     # the STD renderer). DanserHud now handles skin_dir=None; plain _Hud only if
     # DanserHud fails to build.
@@ -1152,13 +1165,43 @@ def _stream_master_requested(overlay_extra) -> bool:
     return os.environ.get("R3D_STREAM_MASTER") == "1" and not overlay_extra
 
 
-def _write_stream_marker(output_path: Path) -> None:
-    """`<out stem>.stream.json`, written BEFORE ffmpeg starts."""
+def _write_stream_marker(output_path: Path, compact: bool = False) -> None:
+    """`<out stem>.stream.json`, written BEFORE ffmpeg starts. `compact` says
+    the inline Discord copy is being written too, also without +faststart."""
     import json as _json
     marker = output_path.parent / (output_path.stem + ".stream.json")
     marker.write_text(_json.dumps(
-        {"schema": 1, "faststart": False, "loudnorm": STREAM_LOUDNORM}))
+        {"schema": 1, "faststart": False, "loudnorm": STREAM_LOUDNORM,
+         "compact": bool(compact)}))
 
+
+
+def _compact_wanted(total_dur_s, w, h, fps, default_factor) -> bool:
+    """Whether to write the inline Discord copy for this render.
+
+    R3D_COMPACT_INLINE=1 asks for it. The copy costs a second software encode
+    for the whole render, and it is only used when the master is too big to be
+    the Discord file itself, so R3D_COMPACT_IF_OVER_BYTES=<n> limits it to
+    renders whose master is EXPECTED to exceed n bytes: duration x bitrate,
+    with the bitrate taken from R3D_COMPACT_EXPECT_BPS (what this node's
+    masters of this kind have actually averaged, supplied by the client) or,
+    lacking that, the encoder ladder times `default_factor`. Without a limit,
+    or without a duration, the copy is always written."""
+    if os.environ.get("R3D_COMPACT_INLINE") != "1":
+        return False
+    try:
+        limit = int(os.environ.get("R3D_COMPACT_IF_OVER_BYTES", "0") or 0)
+    except ValueError:
+        limit = 0
+    if limit <= 0 or not total_dur_s or total_dur_s <= 0:
+        return True
+    try:
+        bps = float(os.environ.get("R3D_COMPACT_EXPECT_BPS", "0") or 0)
+    except ValueError:
+        bps = 0.0
+    if bps <= 0:
+        bps = nvenc_target_bps(int(w), int(h), float(fps)) * default_factor
+    return total_dur_s * bps / 8.0 > 0.9 * limit
 
 
 def _preview_video_bps(total_dur_s: "float | None") -> int:
@@ -1176,7 +1219,8 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
                   start_ms: int, rate: float = 1.0, total_dur_s: float | None = None,
                   hitsound_wav: Path | None = None, is_nc: bool = False,
                   preview_path: "Path | None" = None,
-                  stream_master: bool = False):
+                  stream_master: bool = False,
+                  compact_path: "Path | None" = None):
     w, h = cfg.resolution
     enc, dev = _probe_encoder(cfg)
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
@@ -1315,8 +1359,18 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
             vm_tail = "format=nv12,hwupload"
             vc = [x for i, x in enumerate(vc)
                   if not (x == "-vf" or (i and vc[i - 1] == "-vf"))]
-        graph.append(f"[0:v]split=2[vm0][vp0];[vm0]{vm_tail}[vm];"
-                     f"[vp0]scale=-2:720,fps={pfps}[vp]")
+        if compact_path is not None:
+            # third branch: the Discord copy, to the compact plan (never
+            # upscaled past the master, never above the master's frame rate)
+            c_h, c_max, c_abps, c_fps = _embed_compact_plan(total_dur_s)
+            c_h = min(c_h, int(h))
+            c_fps = min(c_fps, int(round(float(cfg.fps))))
+            graph.append(f"[0:v]split=3[vm0][vp0][vc0];[vm0]{vm_tail}[vm];"
+                         f"[vp0]scale=-2:720,fps={pfps}[vp];"
+                         f"[vc0]scale=-2:{c_h}:flags=bilinear,fps={c_fps}[vc]")
+        else:
+            graph.append(f"[0:v]split=2[vm0][vp0];[vm0]{vm_tail}[vm];"
+                         f"[vp0]scale=-2:720,fps={pfps}[vp]")
         if audio is not None:
             pre = prenorm is not None
             if hitsound_wav is not None:
@@ -1343,11 +1397,18 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
             # loudnorm-cache path: master audio md5 differed with the preview
             # on. With the pin the 192 kHz conversion stays on the preview branch.
             # 48000 is what the master is encoded at (-ar 48000 below).
+            _ac = "[ac]" if compact_path is not None else ""
+            _an = 3 if compact_path is not None else 2
             if stream_master:
-                # ONE loudness pass on the shared branch: the master and the
-                # preview carry the same normalised audio.
+                # ONE loudness pass on the shared branch: the master, the
+                # preview (and the Discord copy) carry the same normalised audio.
                 graph.append(f"[aout]{STREAM_LOUDNORM},"
-                             "aformat=sample_rates=48000,asplit=2[am][ap]")
+                             f"aformat=sample_rates=48000,asplit={_an}[am][ap]{_ac}")
+            elif compact_path is not None:
+                # the Discord copy is cut from the FINAL (normalised) audio,
+                # like the one the client encodes from the finished master
+                graph.append("[aout]aformat=sample_rates=48000,asplit=2[am][ap0];"
+                             "[ap0]loudnorm=I=-18:TP=-1.5:LRA=11,asplit=2[ap][ac]")
             else:
                 graph.append("[aout]aformat=sample_rates=48000,asplit=2[am][ap0];"
                              "[ap0]loudnorm=I=-18:TP=-1.5:LRA=11[ap]")
@@ -1368,6 +1429,17 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
         if audio is not None:
             cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-shortest"]
         cmd += ["-movflags", "+faststart", str(preview_path)]
+        if compact_path is not None:
+            # output 3: the Discord copy. Same recipe as the node's own compact
+            # encode (libx264 veryfast crf 21 + VBV at the plan's maxrate).
+            cmd += ["-map", "[vc]"] + (["-map", "[ac]"] if audio is not None else [])
+            cmd += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                    "-crf", "21", "-maxrate", str(c_max),
+                    "-bufsize", str(max(1, c_max // 2)), "-g", str(c_fps),
+                    "-threads", str(max(2, min(6, (os.cpu_count() or 4) // 2)))]
+            if audio is not None:
+                cmd += ["-c:a", "aac", "-ar", "48000", "-b:a", str(c_abps), "-shortest"]
+            cmd += _mfast + [str(compact_path)]
     import tempfile
     errf = tempfile.NamedTemporaryFile(
         prefix="catch_ffmpeg_", suffix=".log", delete=False, mode="w+",
