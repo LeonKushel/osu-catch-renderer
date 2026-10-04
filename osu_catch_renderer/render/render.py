@@ -696,9 +696,18 @@ def render_core(
         preview_path = output_path.parent / (output_path.stem + ".embed.mp4")
         print(f"[catch] inline preview -> {preview_path.name}",
               file=sys.stderr, flush=True)
+    # A failed play gets its audio rewritten after the render
+    # (apply_fail_audio), so that file is not append-only: no streaming, no
+    # marker, and the client runs its normal post-render pass.
+    stream_master = _stream_master_requested(overlay_extra) and not failed
+    if stream_master:
+        _write_stream_marker(output_path)
+        print("[catch] streamable master (no faststart, loudnorm in-engine)",
+              file=sys.stderr, flush=True)
     proc = _spawn_ffmpeg(cfg, output_path, audio, start_ms, rate, total_dur_s,
                          hitsound_wav=hits_wav, is_nc=is_nc,
-                         preview_path=preview_path)
+                         preview_path=preview_path,
+                         stream_master=stream_master)
     # Argon is the DEFAULT skin: skinless renders stay all-Argon (parity with
     # the STD renderer). DanserHud now handles skin_dir=None; plain _Hud only if
     # DanserHud fails to build.
@@ -1129,6 +1138,29 @@ def nvenc_target_bps(w: int, h: int, fps: float) -> int:
     return int(min(16_000_000.0, max(2_500_000.0, target)))
 
 
+# STREAMABLE MASTER (R3D_STREAM_MASTER=1, default OFF). The contributor client
+# can upload the master WHILE it renders if (a) the file is written front to
+# back -- so no +faststart, which rewrites the whole file at close; the site
+# moves the moov atom itself -- and (b) nothing rewrites it afterwards, so the
+# loudness pass the client would run on the finished file (loudnorm on the
+# MIXED output) is applied here instead. A marker file tells the client this
+# engine honoured the flag; without it the client keeps its post-render pass.
+STREAM_LOUDNORM = "loudnorm=I=-18:TP=-1.5:LRA=11"
+
+
+def _stream_master_requested(overlay_extra) -> bool:
+    return os.environ.get("R3D_STREAM_MASTER") == "1" and not overlay_extra
+
+
+def _write_stream_marker(output_path: Path) -> None:
+    """`<out stem>.stream.json`, written BEFORE ffmpeg starts."""
+    import json as _json
+    marker = output_path.parent / (output_path.stem + ".stream.json")
+    marker.write_text(_json.dumps(
+        {"schema": 1, "faststart": False, "loudnorm": STREAM_LOUDNORM}))
+
+
+
 def _preview_video_bps(total_dur_s: "float | None") -> int:
     """Video bitrate of the lean preview embed. Mirrors the contributor
     client's makeEmbedVariant (and the bot's _transcode_embed_unbounded):
@@ -1143,12 +1175,16 @@ def _preview_video_bps(total_dur_s: "float | None") -> int:
 def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
                   start_ms: int, rate: float = 1.0, total_dur_s: float | None = None,
                   hitsound_wav: Path | None = None, is_nc: bool = False,
-                  preview_path: "Path | None" = None):
+                  preview_path: "Path | None" = None,
+                  stream_master: bool = False):
     w, h = cfg.resolution
     enc, dev = _probe_encoder(cfg)
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
     if enc == "h264_vaapi" and dev:
         cmd += ["-vaapi_device", dev]
+    # stream_master: the master gets the final loudness pass here and no
+    # +faststart (see STREAM_LOUDNORM above). Default False = command unchanged.
+    _mfast = [] if stream_master else ["-movflags", "+faststart"]
     # RGBA ZERO-COPY PIPELINE: the frame producer hands the GL readback
     # buffer straight down the pipe (no 24<->32-bit repack). rgba input
     # yields BIT-IDENTICAL yuv420p to rgb24 (verified with framemd5);
@@ -1244,13 +1280,18 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
                     audio_offset_ms=cfg.audio_offset_ms,
                     hitsound_volume=getattr(cfg, "hitsound_volume", 100),
                     is_nc=is_nc, pre_normalized=pre)
-                cmd += ["-filter_complex", fc, "-map", "0:v", "-map", "[aout]"]
+                if stream_master:
+                    fc += f";[aout]{STREAM_LOUDNORM}[aoutn]"
+                cmd += ["-filter_complex", fc, "-map", "0:v",
+                        "-map", "[aoutn]" if stream_master else "[aout]"]
             else:
                 af = _audio_filter(start_ms, rate, total_dur_s,
                                    music_volume=cfg.music_volume,
                                    general_volume=cfg.general_volume,
                                    audio_offset_ms=cfg.audio_offset_ms, is_nc=is_nc,
                                    pre_normalized=pre)
+                if stream_master:
+                    af = (af + "," if af else "") + STREAM_LOUDNORM
                 if af:
                     cmd += ["-af", af]
             cmd += acodec
@@ -1258,7 +1299,7 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
         # web-streamable: move the moov atom to the front so browsers/iOS can
         # play before the whole file downloads (loudnorm re-adds this, but be
         # robust if that post-step is skipped/fails).
-        cmd += ["-movflags", "+faststart", str(output_path)]
+        cmd += _mfast + [str(output_path)]
     else:
         # TWO OUTPUTS FROM ONE PROCESS. The frame pipe is read once; `split`
         # hands the SAME frames to the master encoder (unchanged settings) and
@@ -1302,13 +1343,19 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
             # loudnorm-cache path: master audio md5 differed with the preview
             # on. With the pin the 192 kHz conversion stays on the preview branch.
             # 48000 is what the master is encoded at (-ar 48000 below).
-            graph.append("[aout]aformat=sample_rates=48000,asplit=2[am][ap0];"
-                         "[ap0]loudnorm=I=-18:TP=-1.5:LRA=11[ap]")
+            if stream_master:
+                # ONE loudness pass on the shared branch: the master and the
+                # preview carry the same normalised audio.
+                graph.append(f"[aout]{STREAM_LOUDNORM},"
+                             "aformat=sample_rates=48000,asplit=2[am][ap]")
+            else:
+                graph.append("[aout]aformat=sample_rates=48000,asplit=2[am][ap0];"
+                             "[ap0]loudnorm=I=-18:TP=-1.5:LRA=11[ap]")
         cmd += ["-filter_complex", ";".join(graph)]
         # output 1: the master, exactly as without the preview
         cmd += ["-map", "[vm]"] + (["-map", "[am]"] if audio is not None else [])
         cmd += vc + (acodec if audio is not None else [])
-        cmd += ["-movflags", "+faststart", str(output_path)]
+        cmd += _mfast + [str(output_path)]
         # output 2: the preview. libx264 on every node, deliberately: a second
         # NVENC/VAAPI session can fail to open (session limits), and one failed
         # output kills the whole process and with it the render.
