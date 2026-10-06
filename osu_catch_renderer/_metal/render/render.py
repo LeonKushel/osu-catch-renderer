@@ -59,6 +59,8 @@ except ValueError:
 # largest single Front-1 lever -- but it CHANGES OUTPUT BYTES, so it is a
 # deliverable decision, not a tuning knob. Default keeps the shipped value.
 _X264_PRESET = os.environ.get("R3D_X264_PRESET", "veryfast").strip() or "veryfast"
+# R3D_X264_CRF: the same knob the other engines take. Unset = the shipped 23.
+_X264_CRF = os.environ.get("R3D_X264_CRF", "").strip()
 _ABLATE_HUD = os.environ.get("R3D_ABLATE_HUD") == "1"
 
 # R3D_TIMELINE=<path>: append one row per stage per frame, so the ACTUAL
@@ -2118,7 +2120,8 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
         else:
             # crf 23 = the shipped GL path's value (R3D size policy #87). This
             # backend forked before that change and was still on crf 20.
-            cmd += ["-c:v", "libx264", "-preset", _X264_PRESET, "-pix_fmt", "yuv420p", "-crf", "23"]
+            cmd += ["-c:v", "libx264", "-preset", _X264_PRESET, "-pix_fmt", "yuv420p",
+                    "-crf", _X264_CRF or "23"]
         # R3D_X264_PARAMS: extra -x264-params, ":"-joined. The preset ladder
         # is coarse -- veryfast to ultrafast is +32% end-to-end for 3.2x the
         # file -- so the useful points are between them: ultrafast with cabac
