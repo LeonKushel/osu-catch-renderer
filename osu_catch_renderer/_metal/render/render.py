@@ -30,6 +30,7 @@ from osu_catch_renderer._metal.render.death import (FAIL_FADE_MS, apply_death,
                                              death_progress)
 from osu_catch_renderer._metal.render.flashlight import CatchFlashlight, has_flashlight
 from osu_catch_renderer._metal.render.gl import SpriteRenderer
+from osu_catch_renderer import preview_hw as _phw
 from osu_catch_renderer._metal.render import loudnorm_cache
 from osu_catch_renderer._metal.beatmap.models import RenderConfig, ar_to_preempt_ms, ObjType
 from osu_catch_renderer._metal.beatmap.replay import parse_replay
@@ -1716,6 +1717,11 @@ def render_core(
         errlog = getattr(proc, "_catch_errlog", None)
         if errlog and Path(errlog).exists():
             tail = Path(errlog).read_text(errors="replace")[-800:]
+        # a hardware preview that failed must not fail the NEXT render too
+        if _phw.note_preview_failure(list(getattr(proc, "args", []) or []),
+                                     tail.encode("utf-8", "replace")):
+            tail += ("\n[the preview's hardware encoder is now off for 24 h on "
+                     "this node; the next render uses the CPU preview]")
         raise CatchRenderError(f"ffmpeg exited {ret}\n{tail}")
     if os.environ.get("R3D_NULL_SINK") == "1":
         # Profiling sink writes no file by design; the size check would raise on
@@ -2219,6 +2225,17 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
             vm_tail = vc[_i + 1]
             vc = vc[:_i] + vc[_i + 2:]
         pfps = min(30, int(round(float(cfg.fps))))
+        # hardware preview (osu_catch_renderer/preview_hw.py; a Mac's media
+        # engine, where the probe passes): the first frame repeated in front,
+        # cut off again after encoding. "" leaves the graph as it was.
+        # Only when the master is on a software encoder: then the preview's is
+        # the one hardware session this process holds. A master that is itself
+        # on a hardware encoder keeps the preview on x264 (a second session can
+        # be refused, and one failed output kills the render).
+        preview_hw = str(enc).startswith("lib") and _phw.preview_on_media_engine()
+        if preview_hw and audio is not None and not (total_dur_s and total_dur_s > 0):
+            preview_hw = False   # no known length to end the audio at: stay on x264
+        _lead = ("," + _phw.vt_lead_in_filter(pfps)) if preview_hw else ""
         if compact_path is not None:
             # third branch: the Discord copy, to the compact plan (never
             # upscaled past the master, never above the master's frame rate)
@@ -2226,11 +2243,11 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
             c_h = min(c_h, int(h))
             c_fps = min(c_fps, int(round(float(cfg.fps))))
             graph = [f"[0:v]split=3[vm0][vp0][vc0];[vm0]{vm_tail}[vm];"
-                     f"[vp0]fps={pfps},scale=-2:720[vp];"
+                     f"[vp0]fps={pfps},scale=-2:720{_lead}[vp];"
                      f"[vc0]fps={c_fps},scale=-2:{c_h}:flags=bilinear[vc]"]
         else:
             graph = [f"[0:v]split=2[vm0][vp0];[vm0]{vm_tail}[vm];"
-                     f"[vp0]fps={pfps},scale=-2:720[vp]"]
+                     f"[vp0]fps={pfps},scale=-2:720{_lead}[vp]"]
         atail: list = []
         if audio is not None:
             if aargs[:1] == ["-filter_complex"]:
@@ -2265,6 +2282,13 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
             else:
                 graph.append(f"[aout]{_pin}asplit=2[am][ap0];"
                              "[ap0]loudnorm=I=-18:TP=-1.5:LRA=11[ap]")
+        if _lead and audio is not None:
+            # the usual end-of-stream rule (`-shortest` / `-t`) measures the
+            # preview's video BEFORE the lead-in is cut off, so it cannot be
+            # used on this output (see where it is left out below). The video's
+            # length is known here: end the preview's audio there instead.
+            graph[-1] = graph[-1].replace("[ap]", "[ap_full]")
+            graph.append(f"[ap_full]atrim=end={float(total_dur_s):.6f}[ap]")
         cmd += ["-filter_complex", ";".join(graph)]
         # output 1: the master, args exactly as without the preview
         cmd += ["-map", "[vm]"] + (["-map", "[am]"] if audio is not None else [])
@@ -2272,18 +2296,26 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
         if os.environ.get("R3D_NO_FASTSTART") != "1" and not stream_master:
             cmd += ["-movflags", "+faststart"]
         cmd += [str(output_path)]
-        # output 2: the preview. libx264 always (a second HW session can fail
-        # to open and one failed output kills the render). Same tail rule as the
-        # master (-t / -shortest) so both files have the master's duration.
+        # output 2: the preview. libx264 unless a hardware session was proved
+        # to open here (`preview_hw`): a second HW session can fail to open and
+        # one failed output kills the render; on a Mac the master is on x264,
+        # so the preview's is the only hardware session this process holds.
+        # Same tail rule as the master (-t / -shortest) so both files have the
+        # master's duration -- except behind the hardware preview's lead-in,
+        # where that rule would cut the last half second of video: there the
+        # audio is ended explicitly (the atrim above).
         vbps = _preview_video_bps(total_dur_s)
         _ptail = [x for x in atail[atail.index("192k") + 1:]] if "192k" in atail else []
         cmd += ["-map", "[vp]"] + (["-map", "[ap]"] if audio is not None else [])
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-                "-b:v", str(vbps), "-maxrate", str(int(vbps * 1.25)),
-                "-bufsize", str(vbps * 2), "-g", "30",
-                "-threads", str(max(2, min(4, (os.cpu_count() or 4) - 2)))]
+        if preview_hw:
+            cmd += _phw.hw_video_args(vbps, pfps)
+        else:
+            cmd += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                    "-b:v", str(vbps), "-maxrate", str(int(vbps * 1.25)),
+                    "-bufsize", str(vbps * 2), "-g", "30",
+                    "-threads", str(max(2, min(4, (os.cpu_count() or 4) - 2)))]
         if audio is not None:
-            cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000"] + _ptail
+            cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000"] + ([] if _lead else _ptail)
         cmd += _preview_sink_args(preview_path)
         if compact_path is not None:
             # output 3: the Discord copy. Same recipe as the node's own compact
